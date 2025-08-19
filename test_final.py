@@ -11,6 +11,79 @@ import numpy as np
 from torch.amp import GradScaler, autocast
 import cv2
 
+# --- 1. 定义形态学损失 ---
+class MorphologicalLoss(nn.Module):
+    def __init__(self, kernel_size=5, alpha=0.5):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.alpha = alpha
+        self.padding = kernel_size // 2
+        self.kernel = self._create_circular_kernel(kernel_size)
+        
+    def _create_circular_kernel(self, size):
+        kernel = torch.zeros((size, size))
+        center = size // 2
+        for i in range(size):
+            for j in range(size):
+                if (i - center)**2 + (j - center)**2 <= center**2:
+                    kernel[i, j] = 1
+        return kernel.view(1, 1, size, size)
+    
+    def forward(self, pred, target):
+        # 处理预测结果（支持多分类和二分类）
+        if pred.shape[1] > 1:
+            pred_probs = F.softmax(pred, dim=1)
+            pred_foreground = pred_probs[:, 1:].sum(dim=1, keepdim=True)
+        else:
+            pred_foreground = torch.sigmoid(pred)
+        
+        # 处理目标（转为one-hot）
+        target_onehot = F.one_hot(target, num_classes=pred.shape[1]).permute(0, 3, 1, 2).float()
+        target_foreground = target_onehot[:, 1:].sum(dim=1, keepdim=True)
+        
+        # 腐蚀损失
+        eroded_pred = self._binary_erosion(pred_foreground)
+        eroded_target = self._binary_erosion(target_foreground)
+        erosion_loss = F.mse_loss(eroded_pred, eroded_target)
+        
+        # 膨胀损失
+        dilated_pred = self._binary_dilation(pred_foreground)
+        dilated_target = self._binary_dilation(target_foreground)
+        dilation_loss = F.mse_loss(dilated_pred, dilated_target)
+        
+        return self.alpha * erosion_loss + (1 - self.alpha) * dilation_loss
+    
+    def _binary_erosion(self, x):
+        return -F.max_pool2d(-x, kernel_size=self.kernel_size, 
+                           stride=1, padding=self.padding)
+    
+    def _binary_dilation(self, x):
+        return F.max_pool2d(x, kernel_size=self.kernel_size,
+                          stride=1, padding=self.padding)
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1e-5):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
+
+    def forward(self, inputs, targets):
+        # 将 inputs 转换为二值掩码
+        if inputs.shape[1] > 1:  # 多分类任务
+            inputs = F.softmax(inputs, dim=1)
+            inputs = torch.argmax(inputs, dim=1)
+        else:  # 二分类任务
+            inputs = torch.sigmoid(inputs)
+            inputs = (inputs > 0.5).float()
+        # Flatten the inputs and targets
+        inputs = inputs.view(-1)
+        targets = targets.view(-1)
+        # Compute intersection
+        intersection = (inputs * targets).sum()
+        # Compute Dice coefficient
+        dice = (2. * intersection + self.smooth) / (inputs.sum() + targets.sum() + self.smooth)
+        # Compute Dice Loss
+        return 1 - dice
+
 # 定义 DeepLabv3+ 的 ASPP 模块
 class ASPP(nn.Module):
     def __init__(self, in_channels, out_channels=64, atrous_rates=[6, 12, 18]):
@@ -84,6 +157,13 @@ class UltraLightSegmentation(nn.Module):
         x = self.decoder(x, low_level_feat)
         x = F.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
         return x
+    
+# def adjust_gamma(image, gamma=1.0):
+#     # 构建查找表
+#     inv_gamma = 1.0 / gamma
+#     table = np.array([((i / 255.0) ** inv_gamma) * 255 
+#                       for i in np.arange(0, 256)]).astype("uint8")
+#     return cv2.LUT(image, table)
 
 # 自定义数据集类（保持不变）
 class SegmentationDataset(Dataset):
@@ -111,12 +191,16 @@ class SegmentationDataset(Dataset):
     def __getitem__(self, idx):
         img_path = os.path.join(self.image_dir, self.images[idx])
         mask_path = os.path.join(self.mask_dir, self.masks[idx])
-
         try:
-            # Read image with OpenCV (BGR format)
+            # 读取图像
             image = cv2.imread(img_path)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)  # Read mask as grayscale
+            if image is None:
+                raise ValueError(f"Failed to load image: {img_path}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)       
+            # 亮度增强：RGB三通道乘以10倍并截断到255
+            # image = np.clip(image.astype(np.float32) * 2, 0, 255).astype(np.uint8)
+            # image = adjust_gamma(image, gamma=2.0)
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         except Exception as e:
             print(f"Error loading {img_path} or {mask_path}: {e}")
             raise e
@@ -145,106 +229,114 @@ class SegmentationDataset(Dataset):
             mask = torch.from_numpy(mask_np)
 
         return image, mask
-
-# 数据集路径（保持不变）
-train_image_dir = 'C:/Users/admin/Desktop/redDataset/train/images'
-train_mask_dir = 'C:/Users/admin/Desktop/redDataset/train/masks'
-
-# train_image_dir = '/home/yang/Work/722Sent/new_dataset/tempBlueNone/train/images'
-# train_mask_dir = '/home/yang/Work/722Sent/new_dataset/tempBlueNone/train/masks'
-
-val_image_dir = 'C:/Users/admin/Desktop/redDataset/test/images'
-val_mask_dir = 'C:/Users/admin/Desktop/redDataset/test/masks'
-
-# val_image_dir = '/home/yang/Work/722Sent/new_dataset/tempBlueNone/train/images'
-# val_mask_dir = '/home/yang/Work/722Sent/new_dataset/tempBlueNone/train/masks'
-
-# 数据预处理（无归一化，resize 已由 cv2 处理）
-image_transform = None  # No normalization, resizing handled in dataset
-image_size = (256, 320)  
-
-# 加载数据集
-train_dataset = SegmentationDataset(train_image_dir, train_mask_dir, image_size=image_size, transform=image_transform)
-val_dataset = SegmentationDataset(val_image_dir, val_mask_dir, image_size=image_size, transform=image_transform)
-
-# 设置 DataLoader（保持不变）
-train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=12, pin_memory=True)
-val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False, num_workers=12, pin_memory=True)
-
-# 主程序
-if __name__ == '__main__':
-    # 设置多进程启动方式
-    torch.multiprocessing.set_start_method('spawn', force=True)
     
-    # 初始化设备
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device):
+    scaler = GradScaler()
+    morph_loss = MorphologicalLoss(kernel_size=5, alpha=0.5).to(device)
+    dice_loss = DiceLoss().to(device)
+    morph_weight = 0.1  # 初始权重
+    dice_weight = 0.3  # Dice Loss 的权重
+    best_val_loss = float('inf')
+    checkpoint_dir = './model_320'
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    for epoch in range(num_epochs):
+        # --- 训练阶段 ---
+        model.train()
+        running_loss = 0.0
+        running_ce = 0.0
+        running_morph = 0.0
+        running_dice = 0.0
+
+        for images, masks in train_loader:
+            images, masks = images.to(device), masks.to(device)
+
+            optimizer.zero_grad()
+            with autocast(device_type='cuda'):
+                outputs = model(images)
+                ce_loss = criterion(outputs, masks)
+                morph_loss_value = morph_loss(outputs, masks)
+                dice_loss_value = dice_loss(outputs, masks)
+                total_loss = ce_loss + morph_weight * morph_loss_value + dice_weight * dice_loss_value
+
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += total_loss.item() * images.size(0)
+            running_ce += ce_loss.item() * images.size(0)
+            running_morph += morph_loss_value.item() * images.size(0)
+            running_dice += dice_loss_value.item() * images.size(0)
+
+        # 打印训练统计信息
+        epoch_loss = running_loss / len(train_loader.dataset)
+        epoch_ce = running_ce / len(train_loader.dataset)
+        epoch_morph = running_morph / len(train_loader.dataset)
+        epoch_dice = running_dice / len(train_loader.dataset)
+        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {epoch_loss:.4f} '
+              f'(CE: {epoch_ce:.4f}, Morph: {epoch_morph:.4f}, Dice: {epoch_dice:.4f})')
+
+        # --- 验证阶段 ---
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for images, masks in val_loader:
+                images, masks = images.to(device), masks.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, masks)  # 验证阶段仅计算CE损失
+                val_loss += loss.item() * images.size(0)
+
+        val_loss /= len(val_loader.dataset)
+        print(f'Validation CE Loss: {val_loss:.4f}')
+
+        # 保存最佳模型
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'best_model.pth'))
+            print(f'New best model saved (Loss: {best_val_loss:.4f})')
+
+        # 定期保存检查点
+        if (epoch + 1) % 20 == 0:
+            torch.save(model.state_dict(), 
+                       os.path.join(checkpoint_dir, f'epoch_{epoch+1}.pth'))
+
+    # 保存最终模型
+    torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'final_model.pth'))
+    print('Training completed.')
+
+# --- 5. 主程序 ---
+if __name__ == '__main__':
+    # 初始化设置
+    torch.multiprocessing.set_start_method('spawn', force=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     if device.type == 'cuda':
-        print(f"GPU device: {torch.cuda.get_device_name(0)}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    # 数据集路径
+    train_image_dir = 'C:/Users/admin/Desktop/dataset/train/images'
+    train_mask_dir = 'C:/Users/admin/Desktop/dataset/train/masks'
+    val_image_dir = 'C:/Users/admin/Desktop/dataset/test/images'
+    val_mask_dir = 'C:/Users/admin/Desktop/dataset/test/masks'
     
-    # 初始化模型、损失函数和优化器
+    # 数据加载
+    image_size = (256, 320)
+    train_dataset = SegmentationDataset(train_image_dir, train_mask_dir, image_size=image_size)
+    val_dataset = SegmentationDataset(val_image_dir, val_mask_dir, image_size=image_size)
+    
+    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False, num_workers=4, pin_memory=True)
+
+    # 初始化模型
     model = UltraLightSegmentation(num_classes=2).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.0005)
-    scaler = GradScaler()
 
-    # 验证参数量
+    # 参数量统计
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {count_parameters(model)}")
-
-    # 训练循环（保持不变）
-    def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs):
-        checkpoint_dir = './deepmodel_final_total'
-
-        for epoch in range(num_epochs):
-            model.train()
-            running_loss = 0.0
-            for i, (images, masks) in enumerate(train_loader):
-                images, masks = images.to(device), masks.to(device).squeeze(1).long()
-                
-                optimizer.zero_grad()
-                with autocast(device_type='cuda'):
-                    outputs = model(images)
-                    if epoch == 0 and i == 0:
-                        print(f"Epoch 1, Batch 1, Output shape: {outputs.shape}, Mask shape: {masks.shape}")
-                    loss = criterion(outputs, masks)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                
-                running_loss += loss.item() * images.size(0)
-            
-            epoch_loss = running_loss / len(train_loader.dataset)
-            print(f'Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}')
-            
-            # 验证
-            model.eval()
-            val_loss = 0.0
-            with torch.no_grad():
-                for images, masks in val_loader:
-                    images, masks = images.to(device), masks.to(device).squeeze(1).long()
-                    with autocast(device_type='cuda'):
-                        outputs = model(images)
-                        loss = criterion(outputs, masks)
-                    val_loss += loss.item() * images.size(0)
-            
-            val_loss = val_loss / len(val_loader.dataset)
-            print(f'Validation Loss: {val_loss:.4f}')
-
-            # 每 10 个 epoch 保存模型
-            if (epoch + 1) % 20 == 0:
-                epoch_dir = os.path.join(checkpoint_dir, f'epoch_{epoch+1}')
-                os.makedirs(epoch_dir, exist_ok=True)
-                checkpoint_path = os.path.join(epoch_dir, f'deeplabv3plus_segmentation_epoch{epoch+1}.pth')
-                torch.save(model.state_dict(), checkpoint_path)
-                print(f'Saved checkpoint to {checkpoint_path}')
-
-        final_epoch_dir = os.path.join(checkpoint_dir, f'epoch_{num_epochs}')
-        os.makedirs(final_epoch_dir, exist_ok=True)
-        final_checkpoint_path = os.path.join(final_epoch_dir, f'deeplabv3plus_segmentation_epoch{num_epochs}.pth')
-        torch.save(model.state_dict(), final_checkpoint_path)
-        print(f'Saved final model to {final_checkpoint_path}')
+    print(f"Total parameters: {count_parameters(model):,}")
 
     # 开始训练
-    train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=1000)
+    train_model(model, train_loader, val_loader, criterion, optimizer, 
+               num_epochs=300, device=device)
